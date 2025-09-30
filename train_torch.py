@@ -32,7 +32,8 @@ class GridEncoder(nn.Module):
             nn.Conv2d(in_ch, channels, kernel_size=3, padding=1), nn.ReLU(),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1), nn.ReLU()
         )
-        self.head = nn.Linear(channels * width * height + 2 + 4 * 2, hidden)
+        # features = conv(C*W*H) + scores(2) + turn(1) + resources(2*4)
+        self.head = nn.Linear(channels * width * height + 2 + 1 + 4 * 2, hidden)
 
     def forward(self, obs: Dict[str, Any]) -> torch.Tensor:
         # Convert to tensors
