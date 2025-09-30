@@ -36,19 +36,15 @@ class GridEncoder(nn.Module):
 
     def forward(self, obs: Dict[str, Any]) -> torch.Tensor:
         # Convert to tensors
-        terrain = torch.as_tensor(obs['terrain'], dtype=torch.long)  # HxW
-        buildings = torch.as_tensor(obs['buildings'], dtype=torch.long)  # HxW
-        units = torch.as_tensor(obs['units'], dtype=torch.long)  # HxW
+        terrain = torch.as_tensor(obs['terrain'], dtype=torch.float32)  # HxW
+        buildings = torch.as_tensor(obs['buildings'], dtype=torch.float32)  # HxW
+        units = torch.as_tensor(obs['units'], dtype=torch.float32)  # HxW
         scores = torch.as_tensor(obs['scores'], dtype=torch.float32)  # 2
         turn = torch.as_tensor(obs['turn'], dtype=torch.float32)  # 1
         resources = torch.as_tensor(obs['resources'], dtype=torch.float32)  # 2x4
 
-        # One-hot embed small categorical layers (values are small ranges)
-        terrain_f = F.one_hot(terrain.clamp(min=0, max=3), num_classes=4).float().permute(2, 0, 1)
-        buildings_f = F.one_hot(buildings.clamp(min=0, max=9), num_classes=10).float().sum(dim=0, keepdim=True)
-        units_f = F.one_hot(units.clamp(min=0, max=4), num_classes=5).float().sum(dim=0, keepdim=True)
-
-        grid = torch.stack([terrain_f.argmax(0), buildings_f[0], units_f[0]], dim=0)  # 3xHxW simple index features
+        # Simple 3-channel grid with integer indices as float
+        grid = torch.stack([terrain, buildings, units], dim=0)  # 3xHxW
         x = self.conv(grid.unsqueeze(0))  # 1xCxHxW
         x = x.reshape(1, -1)
         flat = torch.cat([
