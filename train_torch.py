@@ -107,17 +107,18 @@ def collect_step(envs: List[StrategyEnv], model: nn.Module, enc: GridEncoder, ga
     actions = dist.sample()  # B
     logps = dist.log_prob(actions)  # B
 
-    rewards = []
-    dones = []
-    values = []
+    rewards_list = []
+    dones_list = []
     # Step each env with its action
     for i, env in enumerate(envs):
         _, r, terminated, truncated, _ = env.step(int(actions[i].item()))
-        rewards.append(torch.as_tensor([r], dtype=torch.float32, device=DEVICE))
-        dones.append(torch.as_tensor([float(terminated or truncated)], dtype=torch.float32, device=DEVICE))
-        values.append(value_batch[i:i+1])  # 1x1 slice
+        rewards_list.append(r)
+        dones_list.append(float(terminated or truncated))
 
-    return (obs_list, mask_list, actions, logps, values, rewards, dones)
+    rewards = torch.as_tensor(rewards_list, dtype=torch.float32, device=DEVICE).unsqueeze(1)  # Bx1
+    dones = torch.as_tensor(dones_list, dtype=torch.float32, device=DEVICE).unsqueeze(1)      # Bx1
+
+    return (obs_list, mask_list, actions, logps, value_batch, rewards, dones)
 
 
 def train(num_envs: int = 8, steps: int = 2000, width: int = 12, height: int = 12, lr: float = 3e-4, gamma: float = 0.99):
@@ -131,17 +132,12 @@ def train(num_envs: int = 8, steps: int = 2000, width: int = 12, height: int = 1
 
     for step in range(steps):
         (_, _, actions, logps, values, rewards, dones) = collect_step(envs, policy, encoder, gamma)
-        returns = []
-        # simple Monte-Carlo return per env step (1-step)
-        for r, d, v in zip(rewards, dones, values):
-            returns.append(r + (1 - d) * v.detach())
-        returns = torch.stack(returns).to(DEVICE)
-        values_t = torch.stack(values).to(DEVICE)
-        logps_t = torch.stack(logps).to(DEVICE)
+        # One-step bootstrap: R = r + (1-d) * V(next) ~ using current V as baseline (semi-on-policy)
+        returns = rewards + (1 - dones) * values.detach()  # Bx1
 
-        advantages = returns - values_t.detach()
-        policy_loss = -(advantages * logps_t).mean()
-        value_loss = F.mse_loss(values_t, returns)
+        advantages = returns - values.detach()
+        policy_loss = -(advantages.squeeze(1) * logps).mean()
+        value_loss = F.mse_loss(values, returns)
         loss = policy_loss + 0.5 * value_loss
 
         opt.zero_grad()
