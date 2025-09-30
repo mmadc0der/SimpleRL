@@ -146,7 +146,7 @@ def train(num_envs: int = 8, steps: int = 2000, width: int = 12, height: int = 1
         opt.step()
 
         if (step + 1) % 50 == 0:
-            avg_r = torch.stack(rewards).mean().item()
+            avg_r = rewards.mean().item()
             print(f"Step {step+1}: loss={loss.item():.3f} pi={policy_loss.item():.3f} v={value_loss.item():.3f} r={avg_r:.2f}")
 
     # Close envs
