@@ -37,8 +37,32 @@ class GridEncoder(nn.Module):
         # features = conv(C*W*H) + scores(2) + turn(1) + resources(2*4)
         self.head = nn.Linear(channels * width * height + 2 + 1 + 4 * 2, hidden)
 
-    def forward(self, obs: Dict[str, Any]) -> torch.Tensor:
-        # Convert to tensors
+    def forward(self, obs: Any) -> torch.Tensor:
+        """Encode either a single observation dict or a list of dicts into embeddings."""
+        if isinstance(obs, list):
+            # Batch path
+            terrains = [torch.as_tensor(o['terrain'], dtype=torch.float32, device=DEVICE) for o in obs]
+            buildings = [torch.as_tensor(o['buildings'], dtype=torch.float32, device=DEVICE) for o in obs]
+            units = [torch.as_tensor(o['units'], dtype=torch.float32, device=DEVICE) for o in obs]
+            scores = [torch.as_tensor(o['scores'], dtype=torch.float32, device=DEVICE) for o in obs]
+            turn = [torch.as_tensor(o['turn'], dtype=torch.float32, device=DEVICE) for o in obs]
+            resources = [torch.as_tensor(o['resources'], dtype=torch.float32, device=DEVICE) for o in obs]
+
+            grid = torch.stack([
+                torch.stack(terrains, dim=0),
+                torch.stack(buildings, dim=0),
+                torch.stack(units, dim=0)
+            ], dim=1)  # Bx3xHxW
+            x = self.conv(grid)  # BxCxHxW
+            x = x.reshape(x.shape[0], -1)
+            scores_b = torch.stack(scores, dim=0)
+            turn_b = torch.stack(turn, dim=0)
+            resources_b = torch.stack(resources, dim=0).reshape(len(obs), -1)
+            flat = torch.cat([x, scores_b, turn_b, resources_b], dim=1)
+            h = torch.tanh(self.head(flat))
+            return h  # Bxhidden
+
+        # Single path
         terrain = torch.as_tensor(obs['terrain'], dtype=torch.float32, device=DEVICE)  # HxW
         buildings = torch.as_tensor(obs['buildings'], dtype=torch.float32, device=DEVICE)  # HxW
         units = torch.as_tensor(obs['units'], dtype=torch.float32, device=DEVICE)  # HxW
@@ -46,16 +70,10 @@ class GridEncoder(nn.Module):
         turn = torch.as_tensor(obs['turn'], dtype=torch.float32, device=DEVICE)  # 1
         resources = torch.as_tensor(obs['resources'], dtype=torch.float32, device=DEVICE)  # 2x4
 
-        # Simple 3-channel grid with integer indices as float
         grid = torch.stack([terrain, buildings, units], dim=0)  # 3xHxW
         x = self.conv(grid.unsqueeze(0))  # 1xCxHxW
         x = x.reshape(1, -1)
-        flat = torch.cat([
-            x,
-            scores.reshape(1, -1),
-            turn.reshape(1, -1),
-            resources.reshape(1, -1)
-        ], dim=1)
+        flat = torch.cat([x, scores.reshape(1, -1), turn.reshape(1, -1), resources.reshape(1, -1)], dim=1)
         h = torch.tanh(self.head(flat))
         return h  # 1xhidden
 
@@ -66,42 +84,40 @@ class PolicyHead(nn.Module):
         self.pi = nn.Linear(hidden, action_size)
         self.v = nn.Linear(hidden, 1)
 
-    def forward(self, h: torch.Tensor, mask: np.ndarray) -> Tuple[Categorical, torch.Tensor]:
-        logits = self.pi(h)  # 1xA
-        mask_t = torch.as_tensor(mask, dtype=torch.float32, device=logits.device).unsqueeze(0)
+    def forward(self, h: torch.Tensor, mask: Any) -> Tuple[Categorical, torch.Tensor]:
+        logits = self.pi(h)  # BxA
+        mask_t = torch.as_tensor(mask, dtype=torch.float32, device=logits.device)
+        if mask_t.dim() == 1:
+            mask_t = mask_t.unsqueeze(0)
         masked_logits = logits + (mask_t + 1e-8).log()  # log(0) -> -inf
         dist = Categorical(logits=masked_logits)
-        value = self.v(h)
+        value = self.v(h)  # Bx1
         return dist, value
 
 
 def collect_step(envs: List[StrategyEnv], model: nn.Module, enc: GridEncoder, gamma: float = 0.99):
-    obs_batch = []
-    masks_batch = []
-    actions = []
-    logps = []
-    values = []
+    # Gather observations and masks for all envs
+    obs_list = [env._get_observation() for env in envs]
+    mask_list = [env._compute_action_mask() for env in envs]
+
+    # Encode batch
+    h_batch = enc(obs_list)  # Bxhidden
+    mask_batch = np.stack(mask_list, axis=0)
+    dist, value_batch = model(h_batch, mask_batch)
+    actions = dist.sample()  # B
+    logps = dist.log_prob(actions)  # B
+
     rewards = []
     dones = []
-
-    for env in envs:
-        obs, info = (env._get_observation(), {})
-        mask = env._compute_action_mask()
-        h = enc(obs)
-        dist, value = model(h, mask)
-        action = dist.sample()
-        logp = dist.log_prob(action)
-        next_obs, reward, terminated, truncated, info = env.step(int(action.item()))
-
-        obs_batch.append(obs)
-        masks_batch.append(mask)
-        actions.append(action)
-        logps.append(logp)
-        values.append(value)
-        rewards.append(torch.as_tensor([reward], dtype=torch.float32, device=DEVICE))
+    values = []
+    # Step each env with its action
+    for i, env in enumerate(envs):
+        _, r, terminated, truncated, _ = env.step(int(actions[i].item()))
+        rewards.append(torch.as_tensor([r], dtype=torch.float32, device=DEVICE))
         dones.append(torch.as_tensor([float(terminated or truncated)], dtype=torch.float32, device=DEVICE))
+        values.append(value_batch[i:i+1])  # 1x1 slice
 
-    return (obs_batch, masks_batch, actions, logps, values, rewards, dones)
+    return (obs_list, mask_list, actions, logps, values, rewards, dones)
 
 
 def train(num_envs: int = 8, steps: int = 2000, width: int = 12, height: int = 12, lr: float = 3e-4, gamma: float = 0.99):
@@ -114,7 +130,7 @@ def train(num_envs: int = 8, steps: int = 2000, width: int = 12, height: int = 1
     opt = torch.optim.Adam(params, lr=lr)
 
     for step in range(steps):
-        (obs_batch, masks_batch, actions, logps, values, rewards, dones) = collect_step(envs, policy, encoder, gamma)
+        (_, _, actions, logps, values, rewards, dones) = collect_step(envs, policy, encoder, gamma)
         returns = []
         # simple Monte-Carlo return per env step (1-step)
         for r, d, v in zip(rewards, dones, values):
