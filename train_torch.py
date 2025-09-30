@@ -16,6 +16,8 @@ from torch.distributions import Categorical
 
 from strategy_env import StrategyEnv
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 def make_env(width: int = 12, height: int = 12) -> StrategyEnv:
     return StrategyEnv(width=width, height=height, num_players=2, observation_type='full')
@@ -37,12 +39,12 @@ class GridEncoder(nn.Module):
 
     def forward(self, obs: Dict[str, Any]) -> torch.Tensor:
         # Convert to tensors
-        terrain = torch.as_tensor(obs['terrain'], dtype=torch.float32)  # HxW
-        buildings = torch.as_tensor(obs['buildings'], dtype=torch.float32)  # HxW
-        units = torch.as_tensor(obs['units'], dtype=torch.float32)  # HxW
-        scores = torch.as_tensor(obs['scores'], dtype=torch.float32)  # 2
-        turn = torch.as_tensor(obs['turn'], dtype=torch.float32)  # 1
-        resources = torch.as_tensor(obs['resources'], dtype=torch.float32)  # 2x4
+        terrain = torch.as_tensor(obs['terrain'], dtype=torch.float32, device=DEVICE)  # HxW
+        buildings = torch.as_tensor(obs['buildings'], dtype=torch.float32, device=DEVICE)  # HxW
+        units = torch.as_tensor(obs['units'], dtype=torch.float32, device=DEVICE)  # HxW
+        scores = torch.as_tensor(obs['scores'], dtype=torch.float32, device=DEVICE)  # 2
+        turn = torch.as_tensor(obs['turn'], dtype=torch.float32, device=DEVICE)  # 1
+        resources = torch.as_tensor(obs['resources'], dtype=torch.float32, device=DEVICE)  # 2x4
 
         # Simple 3-channel grid with integer indices as float
         grid = torch.stack([terrain, buildings, units], dim=0)  # 3xHxW
@@ -66,7 +68,7 @@ class PolicyHead(nn.Module):
 
     def forward(self, h: torch.Tensor, mask: np.ndarray) -> Tuple[Categorical, torch.Tensor]:
         logits = self.pi(h)  # 1xA
-        mask_t = torch.as_tensor(mask, dtype=torch.float32).unsqueeze(0)
+        mask_t = torch.as_tensor(mask, dtype=torch.float32, device=logits.device).unsqueeze(0)
         masked_logits = logits + (mask_t + 1e-8).log()  # log(0) -> -inf
         dist = Categorical(logits=masked_logits)
         value = self.v(h)
@@ -96,8 +98,8 @@ def collect_step(envs: List[StrategyEnv], model: nn.Module, enc: GridEncoder, ga
         actions.append(action)
         logps.append(logp)
         values.append(value)
-        rewards.append(torch.as_tensor([reward], dtype=torch.float32))
-        dones.append(torch.as_tensor([float(terminated or truncated)], dtype=torch.float32))
+        rewards.append(torch.as_tensor([reward], dtype=torch.float32, device=DEVICE))
+        dones.append(torch.as_tensor([float(terminated or truncated)], dtype=torch.float32, device=DEVICE))
 
     return (obs_batch, masks_batch, actions, logps, values, rewards, dones)
 
@@ -106,8 +108,8 @@ def train(num_envs: int = 8, steps: int = 2000, width: int = 12, height: int = 1
     envs = [make_env(width, height) for _ in range(num_envs)]
     for env in envs:
         env.reset()
-    encoder = GridEncoder(width, height)
-    policy = PolicyHead(hidden=128, action_size=envs[0].action_space.n)
+    encoder = GridEncoder(width, height).to(DEVICE)
+    policy = PolicyHead(hidden=128, action_size=envs[0].action_space.n).to(DEVICE)
     params = list(encoder.parameters()) + list(policy.parameters())
     opt = torch.optim.Adam(params, lr=lr)
 
@@ -117,9 +119,9 @@ def train(num_envs: int = 8, steps: int = 2000, width: int = 12, height: int = 1
         # simple Monte-Carlo return per env step (1-step)
         for r, d, v in zip(rewards, dones, values):
             returns.append(r + (1 - d) * v.detach())
-        returns = torch.stack(returns)
-        values_t = torch.stack(values)
-        logps_t = torch.stack(logps)
+        returns = torch.stack(returns).to(DEVICE)
+        values_t = torch.stack(values).to(DEVICE)
+        logps_t = torch.stack(logps).to(DEVICE)
 
         advantages = returns - values_t.detach()
         policy_loss = -(advantages * logps_t).mean()
